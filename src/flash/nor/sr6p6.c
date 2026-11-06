@@ -48,6 +48,75 @@ struct sr6p6_flash_bank {
 	SSD_CONFIG ssd;
 };
 
+/* NVM controller (C0/C1/C2) that owns the array behind this bank */
+static uint32_t sr6p6_nvm_reg_base(struct flash_bank *bank)
+{
+	if ((bank->base == 0x28000000) || (bank->base == 0x28400000) ||
+	    (bank->base == 0x29E00000) || (bank->base == 0x29F87000))
+		return MAIN_REG_BASE_C0;
+	if ((bank->base == 0x28800000) || (bank->base == 0x28C00000))
+		return MAIN_REG_BASE_C1;
+	if ((bank->base == 0x29000000) || (bank->base == 0x29400000))
+		return MAIN_REG_BASE_C2;
+	return MAIN_REG_BASE_C0;
+}
+
+/*
+ * The SSD loaders return their status in r0 (0 = OK). target_run_algorithm()
+ * only reports whether the loader reached its breakpoint, so a locked block,
+ * a misaligned request or a program failure used to be reported as success.
+ */
+static int sr6p6_check_rc(struct reg_param *r0, const char *what, target_addr_t addr)
+{
+	uint32_t rc = buf_get_u32(r0->value, 0, 32);
+
+	if (rc == 0)
+		return ERROR_OK;
+	LOG_ERROR("sr6p6: %s at " TARGET_ADDR_FMT " failed, loader returned 0x%" PRIx32,
+		what, addr, rc);
+	return ERROR_FLASH_OPERATION_FAILED;
+}
+
+/*
+ * The write loader stops on the breakpoint inside its CheckStatus routine
+ * (BDMEnable), so r0 is CheckStatus' code: 0x10 once every page of the chunk
+ * is done. A failed program step (PEG=0) is only stored in a loader stack
+ * variable and also stops with 0x10, so the chunk is read back and compared.
+ * It also catches a loader that never really ran: seen once after halting
+ * a running application without a reset (cause not confirmed).
+ */
+static int sr6p6_check_program(struct flash_bank *bank, struct reg_param *r0,
+		uint32_t offset, const uint8_t *expect, uint32_t len)
+{
+	uint32_t rc = buf_get_u32(r0->value, 0, 32);
+	uint8_t *got;
+	int err;
+
+	if (rc != 0 && rc != 0x10) {
+		LOG_ERROR("sr6p6: FlashProgram at " TARGET_ADDR_FMT " failed, loader returned 0x%" PRIx32,
+			bank->base + offset, rc);
+		return ERROR_FLASH_OPERATION_FAILED;
+	}
+
+	got = malloc(len);
+	if (!got)
+		return ERROR_FAIL;
+	err = target_read_buffer(bank->target, bank->base + offset, len, got);
+	if (err == ERROR_OK && memcmp(got, expect, len) != 0) {
+		uint32_t i = 0;
+
+		while (got[i] == expect[i])
+			i++;
+		LOG_ERROR("sr6p6: " TARGET_ADDR_FMT " reads 0x%02x after programming, expected 0x%02x "
+			"(loader code 0x%" PRIx32 "); if the target was halted while running, "
+			"use 'reset init' before flash operations",
+			bank->base + offset + i, got[i], expect[i], rc);
+		err = ERROR_FLASH_OPERATION_FAILED;
+	}
+	free(got);
+	return err;
+}
+
 /* flash bank s6 <base> <size> 0 0 <target#> */
 FLASH_BANK_COMMAND_HANDLER(sr6p6_flash_bank_command)
 {
@@ -88,37 +157,15 @@ static int sr6p6_setlock(struct flash_bank *bank, uint32_t block_space, uint32_t
 	SSD_CONFIG *ssd = &sr6p6_info->ssd;
 	SSD_CONFIG ssd_lock;
 
-	ssd_lock.NVMRegBase = ssd->NVMRegBase;
-	ssd_lock.mainArrayBase = ssd->mainArrayBase;
-	ssd_lock.lowBlockInfo.n16KBlockNum = ssd->lowBlockInfo.n16KBlockNum;
-	ssd_lock.lowBlockInfo.n32KBlockNum = ssd->lowBlockInfo.n32KBlockNum;
-	ssd_lock.lowBlockInfo.n64KBlockNum = ssd->lowBlockInfo.n64KBlockNum;
-
-	ssd_lock.midBlockInfo.n16KBlockNum = ssd->midBlockInfo.n16KBlockNum;
-	ssd_lock.midBlockInfo.n32KBlockNum = ssd->midBlockInfo.n32KBlockNum;
-	ssd_lock.midBlockInfo.n64KBlockNum = ssd->midBlockInfo.n64KBlockNum;
-
-	ssd_lock.highBlockInfo.n16KBlockNum = ssd->highBlockInfo.n16KBlockNum;
-	ssd_lock.highBlockInfo.n32KBlockNum = ssd->highBlockInfo.n32KBlockNum;
-	ssd_lock.highBlockInfo.n64KBlockNum = ssd->highBlockInfo.n64KBlockNum;
-
-	ssd_lock.n256BlockNum = ssd->n256BlockNum;
-	ssd_lock.mainArrayBase = ssd->mainInterfaceFlag;
-	ssd_lock.programmableSize = ssd->programmableSize;
-	ssd_lock.BDMEnable = ssd->BDMEnable;
-
-	if((bank->base == 0x28000000)||(bank->base == 0x28400000)||(bank->base == 0x29E00000)||(bank->base == 0x29F87000))   //Cluster 0 core 0 || Cluster 0 core 1
-	{
-		ssd_lock.NVMRegBase = MAIN_REG_BASE_C0;
-	}
-	else if((bank->base == 0x28800000) || (bank->base == 0x28C00000))   //Cluster 1 core 0 || Cluster 1 core 1
-	{
-		ssd_lock.NVMRegBase = MAIN_REG_BASE_C1;
-	}
-	else if((bank->base == 0x29000000) || (bank->base == 0x29400000))  //Cluster 2 core 0 || Cluster 2 core 1
-	{
-		ssd_lock.NVMRegBase = MAIN_REG_BASE_C2;
-	}
+	/*
+	 * Start from the probed config: the loaders read mainInterfaceFlag (0x30)
+	 * to choose LOCK0..3 (main) or LOCK0A/1A (alternate) and BDMEnable (0x38)
+	 * to stop on the breakpoint. Building the struct field by field left
+	 * mainInterfaceFlag uninitialised, so the lock change could go to the
+	 * alternate registers and LOCK0..3 stayed 0xffffffff.
+	 */
+	ssd_lock = *ssd;
+	ssd_lock.NVMRegBase = sr6p6_nvm_reg_base(bank);
 
 	LOG_DEBUG("%s:%d %s()", __FILE__, __LINE__, __func__);
 
@@ -187,11 +234,10 @@ static int sr6p6_setlock(struct flash_bank *bank, uint32_t block_space, uint32_t
 			setlock_algorithm->address, 0,
 			5000, &armv8_algorithm_info);
 
-	//if ((err != ERROR_OK) || (buf_get_u32(reg_params[0].value, 0, 32) != 0)) {
-	if (err != ERROR_OK) {
-		LOG_INFO("UHHHHHH");
+	if (err != ERROR_OK)
 		err = ERROR_TARGET_FAILURE;
-	}
+	else
+		err = sr6p6_check_rc(&reg_params[0], "FlashSetLock", ssd_lock.NVMRegBase);
 
 	/* Free resources */
 	target_free_working_area(target, ssd_config);
@@ -222,37 +268,15 @@ static int sr6p6_getlock(struct flash_bank *bank,
 	SSD_CONFIG *ssd = &sr6p6_info->ssd;
 	SSD_CONFIG ssd_lock;
 
-	ssd_lock.NVMRegBase = ssd->NVMRegBase;
-	ssd_lock.mainArrayBase = ssd->mainArrayBase;
-	ssd_lock.lowBlockInfo.n16KBlockNum = ssd->lowBlockInfo.n16KBlockNum;
-	ssd_lock.lowBlockInfo.n32KBlockNum = ssd->lowBlockInfo.n32KBlockNum;
-	ssd_lock.lowBlockInfo.n64KBlockNum = ssd->lowBlockInfo.n64KBlockNum;
-
-	ssd_lock.midBlockInfo.n16KBlockNum = ssd->midBlockInfo.n16KBlockNum;
-	ssd_lock.midBlockInfo.n32KBlockNum = ssd->midBlockInfo.n32KBlockNum;
-	ssd_lock.midBlockInfo.n64KBlockNum = ssd->midBlockInfo.n64KBlockNum;
-
-	ssd_lock.highBlockInfo.n16KBlockNum = ssd->highBlockInfo.n16KBlockNum;
-	ssd_lock.highBlockInfo.n32KBlockNum = ssd->highBlockInfo.n32KBlockNum;
-	ssd_lock.highBlockInfo.n64KBlockNum = ssd->highBlockInfo.n64KBlockNum;
-
-	ssd_lock.n256BlockNum = ssd->n256BlockNum;
-	ssd_lock.mainArrayBase = ssd->mainInterfaceFlag;
-	ssd_lock.programmableSize = ssd->programmableSize;
-	ssd_lock.BDMEnable = ssd->BDMEnable;
-
-	if((bank->base == 0x28000000)||(bank->base == 0x28400000)||(bank->base == 0x29E00000)||(bank->base == 0x29F87000))   //Cluster 0 core 0 || Cluster 0 core 1
-	{
-		ssd_lock.NVMRegBase = MAIN_REG_BASE_C0;
-	}
-	else if((bank->base == 0x28800000) || (bank->base == 0x28C00000))   //Cluster 1 core 0 || Cluster 1 core 1
-	{
-		ssd_lock.NVMRegBase = MAIN_REG_BASE_C1;
-	}
-	else if((bank->base == 0x29000000) || (bank->base == 0x29400000))  //Cluster 2 core 0 || Cluster 2 core 1
-	{
-		ssd_lock.NVMRegBase = MAIN_REG_BASE_C2;
-	}
+	/*
+	 * Start from the probed config: the loaders read mainInterfaceFlag (0x30)
+	 * to choose LOCK0..3 (main) or LOCK0A/1A (alternate) and BDMEnable (0x38)
+	 * to stop on the breakpoint. Building the struct field by field left
+	 * mainInterfaceFlag uninitialised, so the lock change could go to the
+	 * alternate registers and LOCK0..3 stayed 0xffffffff.
+	 */
+	ssd_lock = *ssd;
+	ssd_lock.NVMRegBase = sr6p6_nvm_reg_base(bank);
 
 	LOG_DEBUG("%s:%d %s()", __FILE__, __LINE__, __func__);
 
@@ -341,6 +365,9 @@ static int sr6p6_getlock(struct flash_bank *bank,
 		err = ERROR_TARGET_FAILURE;
 		goto flash_getlock_error;
 	}
+	err = sr6p6_check_rc(&reg_params[0], "FlashGetLock", ssd_lock.NVMRegBase);
+	if (err != ERROR_OK)
+		goto flash_getlock_error;
 
 	err = target_read_buffer(target, getlock_working_area->address,
 			4, (uint8_t *)tmp);
@@ -562,8 +589,15 @@ static int sr6p6_write(struct flash_bank *bank, const uint8_t *buffer,
 	};
 
 
-	err = target_write_buffer(target, write_working_area_CtxData->address + 32,
-				32, (uint8_t *)&loc_func);
+	/* CONTEXT_DATA.pReqCompletionFn (offset 32, the last of 36 bytes) */
+	err = target_write_u32(target, write_working_area_CtxData->address + 32, loc_func);
+	if (err != ERROR_OK) {
+		target_free_working_area(target, ssd_config);
+		target_free_working_area(target, write_algorithm);
+		target_free_working_area(target, source);
+		target_free_working_area(target, write_working_area_CtxData);
+		return err;
+	}
 
 	remote_stack_size = WRITE_STACK_SIZE + (chunk_size / C55_PROGRAMMABLE_SIZE * 0x70);
 
@@ -638,6 +672,9 @@ static int sr6p6_write(struct flash_bank *bank, const uint8_t *buffer,
 				6, reg_params,
 				write_algorithm->address, 0,
 				2000000000, &armv8_algorithm_info);
+		if (err == ERROR_OK)
+			err = sr6p6_check_program(bank, &reg_params[0], offset + (i * chunk_size),
+					buffer + (i * chunk_size), size);
 
 		LOG_DEBUG("Device buffer Size: %d, Number of iteraction: %d, Current iteraction: %d, err: %d", chunk_size, chunk_number, i, err);
 
@@ -649,7 +686,8 @@ static int sr6p6_write(struct flash_bank *bank, const uint8_t *buffer,
 		destroy_reg_param(&reg_params[5]);
 
 		if (err != ERROR_OK)  {
-			err = ERROR_TARGET_FAILURE;
+			if (err != ERROR_FLASH_OPERATION_FAILED)
+				err = ERROR_TARGET_FAILURE;
 			target_free_working_area(target, write_algorithm);
 			target_free_working_area(target, source);
 			target_free_working_area(target, write_working_area_CtxData);
@@ -661,6 +699,7 @@ static int sr6p6_write(struct flash_bank *bank, const uint8_t *buffer,
 
 	if(bytes_remain)
 	{
+		uint32_t remain_len = bytes_remain;	/* before padding */
 		uint8_t padding_bytes;
 		uint32_t ind;
 		uint8_t * loc_buffer;
@@ -746,6 +785,9 @@ static int sr6p6_write(struct flash_bank *bank, const uint8_t *buffer,
 				6, reg_params,
 				write_algorithm->address, 0,
 				2000000000, &armv8_algorithm_info);
+		if (err == ERROR_OK)
+			err = sr6p6_check_program(bank, &reg_params[0], offset + (i * chunk_size),
+					buffer + (i * chunk_size), remain_len);
 
 		LOG_DEBUG("Device buffer Size: %d, Number of iteraction: %d, Current iteraction: %d, err: %d", chunk_size, chunk_number, i, err);
 
@@ -759,7 +801,8 @@ static int sr6p6_write(struct flash_bank *bank, const uint8_t *buffer,
 
 
 		if (err != ERROR_OK)  {
-			err = ERROR_TARGET_FAILURE;
+			if (err != ERROR_FLASH_OPERATION_FAILED)
+				err = ERROR_TARGET_FAILURE;
 			target_free_working_area(target, write_algorithm);
 			target_free_working_area(target, source);
 			target_free_working_area(target, write_working_area_CtxData);
@@ -877,7 +920,7 @@ static int sr6p6_writeToErase(struct flash_bank *bank, const uint8_t *buffer,
 	};
 
 	err = target_write_buffer(target, erase_algorithm->address,
-			sizeof(sr6_flash_write_code), (uint8_t *)sr6_flash_erase_code);
+			sizeof(sr6_flash_erase_code), (uint8_t *)sr6_flash_erase_code);
 	if (err != ERROR_OK) {
 		target_free_working_area(target, ssd_config);
 		target_free_working_area(target, erase_algorithm);
@@ -918,6 +961,9 @@ static int sr6p6_writeToErase(struct flash_bank *bank, const uint8_t *buffer,
 			6, reg_params,
 			erase_algorithm->address, 0,
 			2000000000, &armv8_algorithm_info);
+	if (err == ERROR_OK)
+		err = sr6p6_check_rc(&reg_params[0], "erase (program 0xff)",
+				bank->base + WRTE_OFFSET + offset);
 
 	destroy_reg_param(&reg_params[0]);
 	destroy_reg_param(&reg_params[1]);
@@ -927,7 +973,8 @@ static int sr6p6_writeToErase(struct flash_bank *bank, const uint8_t *buffer,
 	destroy_reg_param(&reg_params[5]);
 
 	if (err != ERROR_OK)  {
-		err = ERROR_TARGET_FAILURE;
+		if (err != ERROR_FLASH_OPERATION_FAILED)
+			err = ERROR_TARGET_FAILURE;
 		target_free_working_area(target, erase_algorithm);
 
 		goto flash_erase_error;
@@ -973,6 +1020,7 @@ static int sr6p6_erase(struct flash_bank *bank, unsigned int first, unsigned int
 		LOG_ERROR("Target not halted");
 		return ERROR_TARGET_NOT_HALTED;
 	}
+
 
 	uint32_t low_mask = 0;
 	uint32_t mid_mask = 0;
@@ -1154,7 +1202,11 @@ static int sr6p6_erase(struct flash_bank *bank, unsigned int first, unsigned int
 
 	for (i=first; i<= last; i++)
 	{
-		sr6p6_writeToErase(bank, buffer, bank->sectors[i].offset, bank->sectors[i].size);
+		err = sr6p6_writeToErase(bank, buffer, bank->sectors[i].offset, bank->sectors[i].size);
+		if (err != ERROR_OK) {
+			bank->sectors[i].is_erased = -1;
+			return err;
+		}
 		bank->sectors[i].is_erased = 1;
 		bank->sectors[i].is_protected = 0;
 	}
