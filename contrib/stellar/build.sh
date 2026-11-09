@@ -130,26 +130,25 @@ prefix=/opt/openocd-stellar
 (
     # libtool drops libusb's -Wl,-framework,… flags when it passes them on
     # through libopenocd.la, so the frameworks go to every link on macOS.
+    # On Linux, libtool reads -static in LDFLAGS as "libtool libraries
+    # statically" and still links the executable dynamically against libc;
+    # -static in CC reaches every compile and link unchanged.
+    cc=${CC:-cc}
+    ldflags=
     case "$os" in
-        linux) ldflags=-static ;;
+        linux) cc="$cc -static" ;;
         darwin) ldflags="-framework IOKit -framework CoreFoundation -framework Security" ;;
     esac
     # pkg-config sees only the libraries built above, so nothing from the
     # host (Homebrew, distribution packages) is picked up.
     PKG_CONFIG_LIBDIR="$deps/lib/pkgconfig" PKG_CONFIG="pkg-config --static" \
-        LDFLAGS="$ldflags" \
+        CC="$cc" LDFLAGS="$ldflags" \
         ./configure --prefix="$prefix" \
         --enable-ftdi --enable-dummy --without-capstone --disable-linuxgpiod \
         --disable-jlink --disable-werror \
         --disable-doxygen-html --disable-doxygen-pdf
-    # libtool reads -static as "libtool libraries statically" and links the
-    # executable dynamically against libc; its flag for a fully static
-    # executable is -all-static, which configure's own tests cannot use, so
-    # it goes only to the link of the openocd program.
-    program_ldflags=
-    [ "$os" = linux ] && program_ldflags=-all-static
-    make -j"$jobs" src_openocd_LDFLAGS="$program_ldflags"
-    make install-strip DESTDIR="$work/stage" src_openocd_LDFLAGS="$program_ldflags"
+    make -j"$jobs"
+    make install-strip DESTDIR="$work/stage"
 )
 
 name=openocd-stellar-$target
