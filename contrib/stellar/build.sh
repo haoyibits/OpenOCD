@@ -130,19 +130,17 @@ prefix=/opt/openocd-stellar
 (
     # libtool drops libusb's -Wl,-framework,… flags when it passes them on
     # through libopenocd.la, so the frameworks go to every link on macOS.
-    # On Linux, libtool reads -static in LDFLAGS as "libtool libraries
-    # statically" and still links the executable dynamically against libc;
-    # -static in CC reaches every compile and link unchanged.
-    cc=${CC:-cc}
-    ldflags=
+    # On Linux the executable is static PIE: libtool takes -static (also in
+    # CC, --static and -Bstatic) as its own option and still links against
+    # the shared libc, but passes -static-* flags on to the compiler.
     case "$os" in
-        linux) cc="$cc -static" ;;
+        linux) ldflags=-static-pie ;;
         darwin) ldflags="-framework IOKit -framework CoreFoundation -framework Security" ;;
     esac
     # pkg-config sees only the libraries built above, so nothing from the
     # host (Homebrew, distribution packages) is picked up.
     PKG_CONFIG_LIBDIR="$deps/lib/pkgconfig" PKG_CONFIG="pkg-config --static" \
-        CC="$cc" LDFLAGS="$ldflags" \
+        LDFLAGS="$ldflags" \
         ./configure --prefix="$prefix" \
         --enable-ftdi --enable-dummy --without-capstone --disable-linuxgpiod \
         --disable-jlink --disable-werror \
