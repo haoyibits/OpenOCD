@@ -2,7 +2,9 @@
 
 # Copyright (C) 2020 by Tarek BOUCHKATI <tarek.bouchkati@gmail.com>
 
-on: push
+# By hand only in this fork: it builds Windows snapshots on a retired runner
+# (ubuntu-20.04). openocd-stellar archives: stellar-release.yml.
+on: workflow_dispatch
 
 name: OpenOCD Snapshot
 

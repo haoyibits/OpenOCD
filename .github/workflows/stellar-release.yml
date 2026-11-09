@@ -1,0 +1,123 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+# openocd-stellar archives for contrib/stellar/install.sh.
+#
+# A tag v<openocd>-stellar.<n> builds the archives and publishes them in a
+# release of that tag, with install.sh and the libusb and libftdi sources
+# that are linked into them. A push to the branch that changes the build
+# only builds (the archives are workflow artifacts).
+
+name: openocd-stellar release
+
+on:
+  push:
+    tags:
+      - "v*-stellar.*"
+    branches:
+      - openocd-automotive-mcu-r3
+    paths:
+      - contrib/stellar/**
+      - .github/workflows/stellar-release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # guess-rev.sh names the revision with git describe.
+          fetch-depth: 0
+
+      # Only jimtcl: the other submodules (libjaylink, git2cl) are not used
+      # and live on hosts that are often unreachable.
+      - name: jimtcl
+        run: git submodule update --init jimtcl
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install autoconf automake libtool pkgconf texinfo cmake
+          export PATH="$(brew --prefix texinfo)/bin:$PATH"
+          sh contrib/stellar/build.sh ${{ matrix.target }} dist
+
+      # Alpine (musl) in a container started by hand: JavaScript actions do
+      # not run in Alpine containers on arm64 runners.
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.22 sh -euc '
+            apk add --no-cache build-base autoconf automake libtool pkgconf \
+              texinfo cmake linux-headers git curl tar bzip2 binutils
+            git config --global --add safe.directory /src
+            git config --global --add safe.directory /src/jimtcl
+            sh contrib/stellar/build.sh ${{ matrix.target }} dist
+            chown -R '"$(id -u):$(id -g)"' dist build-stellar
+          '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openocd-stellar-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+      # The library sources, for the release (LGPL).
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        with:
+          name: sources
+          path: build-stellar/downloads/*.tar.bz2
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cp contrib/stellar/install.sh dist/
+          ls -l dist
+          cat > notes.md <<EOF
+          OpenOCD for ST Stellar (StellarLINK, SR6P6 fixes) from branch
+          \`openocd-automotive-mcu-r3\`, as relocatable archives for Apple
+          silicon macOS and Linux (x86_64, aarch64; fully static, musl).
+
+          \`\`\`sh
+          curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/install.sh | sh
+          \`\`\`
+
+          This installs \`openocd-stellar\` into \`~/.local/bin\`; the files go to
+          \`~/.local/lib/openocd-stellar\`. On Linux it prints the udev rules to
+          install for StellarLINK.
+
+          The archives link libusb and libftdi statically; their sources are
+          attached (\`libusb-*.tar.bz2\`, \`libftdi1-*.tar.bz2\`).
+          \`contrib/stellar/build.sh\` rebuilds an archive.
+          EOF
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "openocd-stellar ${TAG#v}" --notes-file notes.md --latest \
+            dist/*
