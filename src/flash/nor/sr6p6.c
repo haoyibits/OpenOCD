@@ -395,6 +395,48 @@ flash_getlock_error:
 	return err;
 }
 
+/*
+ * ST's write loader (sr6_flash_write_code, shared with the other SR6
+ * drivers) sets MCR.EHV for a programmable page and then counts to 99999
+ * (offset 0x1BA) before it calls CheckStatus, which stops on its breakpoint
+ * (BDMEnable) with 0x11 if the page is still being programmed. The count is
+ * about 46 ms per 128 bytes on the 40 MHz IRC clock after 'reset init', so
+ * writing ran at about 2.7 KiB/s. SR6P6 waits for MCR.DONE instead, the bit
+ * the SDK's FlashCheckStatus (StellarSDK 6.0.1, dfp/sr6x/R52/ssd) reads for
+ * "in progress", polling at most 99999 times so it never waits longer than
+ * before. A loader that differs at that offset is written as it is.
+ */
+#define SR6P6_WRITE_WAIT 0x1BA
+
+/* movs r3, #0; str r3, [r7, #32]; b 2f; 1: ldr r3, [r7, #32]; adds r3, #1;
+ * str r3, [r7, #32]; 2: ldr r2, [r7, #32]; movw r3, #0x869f; movt r3, #1;
+ * cmp r2, r3; ble 1b */
+static const uint8_t sr6p6_write_count[] = {
+	0x00, 0x23, 0x3b, 0x62, 0x02, 0xe0, 0x3b, 0x6a, 0x01, 0x33, 0x3b, 0x62,
+	0x3a, 0x6a, 0x48, 0xf2, 0x9f, 0x63, 0xc0, 0xf2, 0x01, 0x03, 0x9a, 0x42,
+	0xf5, 0xdd,
+};
+
+/* ldr r2, [r7, #40] (MCR address); movw r3, #0x869f; movt r3, #1;
+ * 1: ldr r1, [r2]; tst r1, #0x400 (DONE); bne 2f; subs r3, #1; bpl 1b;
+ * 2: nop; nop */
+static const uint8_t sr6p6_write_wait_done[] = {
+	0xba, 0x6a, 0x48, 0xf2, 0x9f, 0x63, 0xc0, 0xf2, 0x01, 0x03, 0x11, 0x68,
+	0x11, 0xf4, 0x80, 0x6f, 0x01, 0xd1, 0x01, 0x3b, 0xf9, 0xd5, 0x00, 0xbf,
+	0x00, 0xbf,
+};
+
+static void sr6p6_write_loader(uint8_t *code)
+{
+	uint8_t *wait = code + SR6P6_WRITE_WAIT;
+
+	memcpy(code, sr6_flash_write_code, sizeof(sr6_flash_write_code));
+	if (memcmp(wait, sr6p6_write_count, sizeof(sr6p6_write_count)) == 0)
+		memcpy(wait, sr6p6_write_wait_done, sizeof(sr6p6_write_wait_done));
+	else
+		LOG_WARNING("sr6p6: unknown write loader, it keeps its fixed wait after each page");
+}
+
 static int sr6p6_write(struct flash_bank *bank, const uint8_t *buffer,
 		uint32_t offset, uint32_t count)
 {
@@ -562,8 +604,10 @@ static int sr6p6_write(struct flash_bank *bank, const uint8_t *buffer,
 	/* Flash driver uses BLX instruction to call CheckStatus */
 	loc_func = loc_func | 1;
 
+	uint8_t write_code[sizeof(sr6_flash_write_code)];
+	sr6p6_write_loader(write_code);
 	err = target_write_buffer(target, write_algorithm->address,
-			sizeof(sr6_flash_write_code), (uint8_t *)sr6_flash_write_code);
+			sizeof(write_code), write_code);
 	if (err != ERROR_OK) {
 		target_free_working_area(target, ssd_config);
 		target_free_working_area(target, write_algorithm);
