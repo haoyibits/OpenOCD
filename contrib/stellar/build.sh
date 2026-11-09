@@ -142,8 +142,14 @@ prefix=/opt/openocd-stellar
         --enable-ftdi --enable-dummy --without-capstone --disable-linuxgpiod \
         --disable-jlink --disable-werror \
         --disable-doxygen-html --disable-doxygen-pdf
-    make -j"$jobs"
-    make install-strip DESTDIR="$work/stage"
+    # libtool reads -static as "libtool libraries statically" and links the
+    # executable dynamically against libc; its flag for a fully static
+    # executable is -all-static, which configure's own tests cannot use, so
+    # it goes only to the link of the openocd program.
+    program_ldflags=
+    [ "$os" = linux ] && program_ldflags=-all-static
+    make -j"$jobs" src_openocd_LDFLAGS="$program_ldflags"
+    make install-strip DESTDIR="$work/stage" src_openocd_LDFLAGS="$program_ldflags"
 )
 
 name=openocd-stellar-$target
